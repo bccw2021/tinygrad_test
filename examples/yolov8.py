@@ -7,10 +7,16 @@ from itertools import chain
 from pathlib import Path
 import cv2
 from collections import defaultdict
-import time, sys
+import time, sys, os, argparse
 from tinygrad.helpers import fetch
 from tinygrad.nn.state import safe_load, load_state_dict
 import json
+
+from tinygrad.helpers import getenv
+print(f"Running on device: {getenv('GPU', 0)}")
+
+import os
+os.environ["GPU"] = "1"  # 使用GPU
 
 #Model architecture from https://github.com/ultralytics/ultralytics/issues/189
 #The upsampling class has been taken from this pull request https://github.com/tinygrad/tinygrad/pull/784 by dc-dc-dc. Now 2(?) models use upsampling. (retinet and this)
@@ -104,7 +110,7 @@ def postprocess(preds, img, orig_imgs):
       all_preds.append(pred)
   return all_preds
 
-def draw_bounding_boxes_and_save(orig_img_paths, output_img_paths, all_predictions, class_labels, iou_threshold=0.5):
+def draw_bounding_boxes(frame, predictions, class_labels, iou_threshold=0.5):
   color_dict = {label: tuple((((i+1) * 50) % 256, ((i+1) * 100) % 256, ((i+1) * 150) % 256)) for i, label in enumerate(class_labels)}
   font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -113,51 +119,57 @@ def draw_bounding_boxes_and_save(orig_img_paths, output_img_paths, all_predictio
     brightness = (r * 299 + g * 587 + b * 114) / 1000
     return brightness > 127
 
+  predictions = np.array(predictions)
+  height, width, _ = frame.shape
+  box_thickness = int((height + width) / 400)
+  font_scale = (height + width) / 2500
+
+  grouped_preds = defaultdict(list)
+  object_count = defaultdict(int)
+
+  for pred_np in predictions:
+    grouped_preds[int(pred_np[-1])].append(pred_np)
+
+  def draw_box_and_label(pred, color):
+    x1, y1, x2, y2, conf, _ = pred
+    x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
+    label = f"{class_labels[class_id]} {conf:.2f}"
+    text_size, _ = cv2.getTextSize(label, font, font_scale, 1)
+    label_y, bg_y = (y1 - 4, y1 - text_size[1] - 4) if y1 - text_size[1] - 4 > 0 else (y1 + text_size[1], y1)
+    cv2.rectangle(frame, (x1, bg_y), (x1 + text_size[0], bg_y + text_size[1]), color, -1)
+    font_color = (0, 0, 0) if is_bright_color(color) else (255, 255, 255)
+    cv2.putText(frame, label, (x1, label_y), font, font_scale, font_color, 1, cv2.LINE_AA)
+
+  for class_id, pred_list in grouped_preds.items():
+    pred_list = np.array(pred_list)
+    while len(pred_list) > 0:
+      max_conf_idx = np.argmax(pred_list[:, 4])
+      max_conf_pred = pred_list[max_conf_idx]
+      pred_list = np.delete(pred_list, max_conf_idx, axis=0)
+      color = color_dict[class_labels[class_id]]
+      draw_box_and_label(max_conf_pred, color)
+      object_count[class_labels[class_id]] += 1
+      iou_scores = box_iou(np.array([max_conf_pred[:4]]), pred_list[:, :4])
+      low_iou_indices = np.where(iou_scores[0] < iou_threshold)[0]
+      pred_list = pred_list[low_iou_indices]
+      for low_conf_pred in pred_list:
+        draw_box_and_label(low_conf_pred, color)
+
+  return frame, object_count
+
+def draw_bounding_boxes_and_save(orig_img_paths, output_img_paths, all_predictions, class_labels, iou_threshold=0.5):
   for img_idx, (orig_img_path, output_img_path, predictions) in enumerate(zip(orig_img_paths, output_img_paths, all_predictions)):
-    predictions = np.array(predictions)
     orig_img = cv2.imread(orig_img_path) if not isinstance(orig_img_path, np.ndarray) else cv2.imdecode(orig_img_path, 1)
-    height, width, _ = orig_img.shape
-    box_thickness = int((height + width) / 400)
-    font_scale = (height + width) / 2500
-
-    grouped_preds = defaultdict(list)
-    object_count = defaultdict(int)
-
-    for pred_np in predictions:
-      grouped_preds[int(pred_np[-1])].append(pred_np)
-
-    def draw_box_and_label(pred, color):
-      x1, y1, x2, y2, conf, _ = pred
-      x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-      cv2.rectangle(orig_img, (x1, y1), (x2, y2), color, box_thickness)
-      label = f"{class_labels[class_id]} {conf:.2f}"
-      text_size, _ = cv2.getTextSize(label, font, font_scale, 1)
-      label_y, bg_y = (y1 - 4, y1 - text_size[1] - 4) if y1 - text_size[1] - 4 > 0 else (y1 + text_size[1], y1)
-      cv2.rectangle(orig_img, (x1, bg_y), (x1 + text_size[0], bg_y + text_size[1]), color, -1)
-      font_color = (0, 0, 0) if is_bright_color(color) else (255, 255, 255)
-      cv2.putText(orig_img, label, (x1, label_y), font, font_scale, font_color, 1, cv2.LINE_AA)
-
-    for class_id, pred_list in grouped_preds.items():
-      pred_list = np.array(pred_list)
-      while len(pred_list) > 0:
-        max_conf_idx = np.argmax(pred_list[:, 4])
-        max_conf_pred = pred_list[max_conf_idx]
-        pred_list = np.delete(pred_list, max_conf_idx, axis=0)
-        color = color_dict[class_labels[class_id]]
-        draw_box_and_label(max_conf_pred, color)
-        object_count[class_labels[class_id]] += 1
-        iou_scores = box_iou(np.array([max_conf_pred[:4]]), pred_list[:, :4])
-        low_iou_indices = np.where(iou_scores[0] < iou_threshold)[0]
-        pred_list = pred_list[low_iou_indices]
-        for low_conf_pred in pred_list:
-          draw_box_and_label(low_conf_pred, color)
-
+    
+    processed_img, object_count = draw_bounding_boxes(orig_img, predictions, class_labels, iou_threshold)
+    
     print(f"Image {img_idx + 1}:")
     print("Objects detected:")
     for obj, count in object_count.items():
       print(f"- {obj}: {count}")
 
-    cv2.imwrite(output_img_path, orig_img)
+    cv2.imwrite(output_img_path, processed_img)
     print(f'saved detections at {output_img_path}')
 
 # utility functions for forward pass.
@@ -414,47 +426,183 @@ def get_weights_location(yolo_variant: str) -> Path:
 
   return weights_location
 
-if __name__ == '__main__':
+def process_video(video_source, output_path, model, class_labels):
+  """Process video from file or camera stream using YOLOv8 model"""
+  # Open video source (file or camera)
+  if video_source.isdigit():
+    cap = cv2.VideoCapture(int(video_source))
+    print(f"Opening camera {video_source}")
+  else:
+    cap = cv2.VideoCapture(video_source)
+    print(f"Opening video file {video_source}")
+  
+  if not cap.isOpened():
+    print(f"Error: Could not open video source {video_source}")
+    return False
+  
+  # Get video properties
+  width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+  height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+  fps = cap.get(cv2.CAP_PROP_FPS)
+  if fps <= 0:
+    fps = 30  # Default FPS if not available
+  
+  # Create video writer
+  fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID'
+  video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+  
+  frame_count = 0
+  processing_times = []
+  
+  try:
+    while True:
+      ret, frame = cap.read()
+      if not ret:
+        if video_source.isdigit():
+          # For camera, just continue
+          continue
+        else:
+          # For video file, break at end
+          break
+      
+      frame_count += 1
+      
+      # Process frame
+      start_time = time.time()
+      
+      # Preprocess frame
+      img = preprocess([frame])
+      
+      # Run inference
+      preds = model(img)
+      
+      # Postprocess predictions
+      all_predictions = postprocess(preds, img, [frame])
+      
+      # Draw bounding boxes
+      processed_frame, object_count = draw_bounding_boxes(frame, all_predictions[0], class_labels)
+      
+      # Calculate processing time
+      end_time = time.time()
+      processing_time = end_time - start_time
+      processing_times.append(processing_time)
+      
+      # Add FPS info to frame
+      fps_text = f"FPS: {1/processing_time:.1f}"
+      cv2.putText(processed_frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+      
+      # Display frame count for videos
+      if not video_source.isdigit():
+        count_text = f"Frame: {frame_count}"
+        cv2.putText(processed_frame, count_text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+      
+      # Save frame to video
+      video_writer.write(processed_frame)
+      
+      # Display frame
+      cv2.imshow('YOLOv8 Detection', processed_frame)
+      
+      # Break on 'q' key press
+      if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+      
+      # Print progress for video files
+      if frame_count % 30 == 0 and not video_source.isdigit():
+        avg_time = sum(processing_times[-30:]) / min(30, len(processing_times[-30:]))
+        print(f"Processed {frame_count} frames. Current FPS: {1/avg_time:.1f}")
+  
+  finally:
+    # Release resources
+    cap.release()
+    video_writer.release()
+    cv2.destroyAllWindows()
+    
+    # Print summary
+    if processing_times:
+      avg_time = sum(processing_times) / len(processing_times)
+      print(f"Processed {frame_count} frames")
+      print(f"Average processing time: {avg_time:.3f}s ({1/avg_time:.1f} FPS)")
+  
+  return True
 
-  # usage : python3 yolov8.py "image_URL OR image_path" "v8 variant" (optional, n is default)
+if __name__ == '__main__':
+  # Parse command line arguments
   if len(sys.argv) < 2:
-    print("Error: Image URL or path not provided.")
+    print("Usage: python3 yolov8.py <image_URL/path OR video_file OR camera_index> [yolo_variant]")
+    print("Examples:")
+    print("  python3 yolov8.py image.jpg n       # Process image with YOLOv8n")
+    print("  python3 yolov8.py video.mp4 m      # Process video with YOLOv8m")
+    print("  python3 yolov8.py 0 s              # Process camera stream with YOLOv8s")
     sys.exit(1)
 
-  img_path = sys.argv[1]
+  source = sys.argv[1]
   yolo_variant = sys.argv[2] if len(sys.argv) >= 3 else (print("No variant given, so choosing 'n' as the default. Yolov8 has different variants, you can choose from ['n', 's', 'm', 'l', 'x']") or 'n')
-  print(f'running inference for YOLO version {yolo_variant}')
-
+  print(f'Running inference for YOLO version {yolo_variant}')
+  
+  # Load model
+  depth, width, ratio = get_variant_multiples(yolo_variant)
+  yolo_model = YOLOv8(w=width, r=ratio, d=depth, num_classes=80)
+  state_dict = safe_load(get_weights_location(yolo_variant))
+  load_state_dict(yolo_model, state_dict)
+  
+  # Load class labels
+  class_labels = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names').read_text().split("\n")
+  
+  # Determine if source is image, video, or camera
+  is_image = False
   output_folder_path = Path('./outputs_yolov8')
   output_folder_path.mkdir(parents=True, exist_ok=True)
-  #absolute image path or URL
-  image_location = [np.frombuffer(fetch(img_path).read_bytes(), np.uint8)]
-  image = [cv2.imdecode(image_location[0], 1)]
-  out_paths = [(output_folder_path / f"{Path(img_path).stem}_output{Path(img_path).suffix or '.png'}").as_posix()]
-  if not isinstance(image[0], np.ndarray):
-    print('Error in image loading. Check your image file.')
-    sys.exit(1)
-  pre_processed_image = preprocess(image)
+  
+  # Check if source is a camera index
+  if source.isdigit():
+    print(f"Processing camera stream from camera {source}")
+    output_path = (output_folder_path / f"camera_{source}_output.mp4").as_posix()
+    process_video(source, output_path, yolo_model, class_labels)
+  
+  # Check if source is a video file
+  elif os.path.isfile(source) and Path(source).suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv', '.webm']:
+    print(f"Processing video file: {source}")
+    output_path = (output_folder_path / f"{Path(source).stem}_output.mp4").as_posix()
+    process_video(source, output_path, yolo_model, class_labels)
+  
+  # Process as image (file or URL)
+  else:
+    print(f"Processing image: {source}")
+    # Handle image URL or file path
+    try:
+      if source.startswith(('http://', 'https://')):
+        # URL image
+        image_data = fetch(source)
+        image_array = np.frombuffer(image_data, np.uint8)
+        image = [cv2.imdecode(image_array, 1)]
+        image_location = [image_array]
+      else:
+        # Local image file
+        image = [cv2.imread(source)]
+        image_location = [source]
+      
+      if not isinstance(image[0], np.ndarray) or image[0] is None:
+        print('Error in image loading. Check your image file.')
+        sys.exit(1)
+      
+      # Process image
+      out_path = (output_folder_path / f"{Path(source).stem}_output{Path(source).suffix or '.png'}").as_posix()
+      pre_processed_image = preprocess(image)
+      
+      st = time.time()
+      predictions = yolo_model(pre_processed_image)
+      print(f'Inference completed in {int(round(((time.time() - st) * 1000)))}ms')
+      
+      post_predictions = postprocess(preds=predictions, img=pre_processed_image, orig_imgs=image)
+      draw_bounding_boxes_and_save(orig_img_paths=image_location, output_img_paths=[out_path], all_predictions=post_predictions, class_labels=class_labels)
+    
+    except Exception as e:
+      print(f"Error processing image: {e}")
+      sys.exit(1)
 
-  # Different YOLOv8 variants use different w , r, and d multiples. For a list , refer to this yaml file (the scales section) https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/models/v8/yolov8.yaml
-  depth, width, ratio = get_variant_multiples(yolo_variant)
-  yolo_infer = YOLOv8(w=width, r=ratio, d=depth, num_classes=80)
-  state_dict = safe_load(get_weights_location(yolo_variant))
-  load_state_dict(yolo_infer, state_dict)
-
-  st = time.time()
-  predictions = yolo_infer(pre_processed_image)
-  print(f'did inference in {int(round(((time.time() - st) * 1000)))}ms')
-
-  post_predictions = postprocess(preds=predictions, img=pre_processed_image, orig_imgs=image)
-
-  #v8 and v3 have same 80 class names for Object Detection
-  class_labels = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names').read_text().split("\n")
-
-  draw_bounding_boxes_and_save(orig_img_paths=image_location, output_img_paths=out_paths, all_predictions=post_predictions, class_labels=class_labels)
+  print("Processing completed!")
 
 # TODO for later:
 #  1. Fix SPPF minor difference due to maxpool
 #  2. AST exp overflow warning while on cpu
 #  3. Make NMS faster
-#  4. Add video inference and webcam support
